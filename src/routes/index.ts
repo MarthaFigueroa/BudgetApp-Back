@@ -1,10 +1,10 @@
 import { Router } from 'express';
 import budgetsRouter from './budgets';
-import baseIncomeRouter from './baseIncome';
+import templatesRouter from './templates';
 
 const router = Router();
 
-router.use('/budgets', budgetsRouter);
-router.use('/base-income', baseIncomeRouter);
+router.use('/budgets',   budgetsRouter);
+router.use('/templates', templatesRouter);
 
 export default router;

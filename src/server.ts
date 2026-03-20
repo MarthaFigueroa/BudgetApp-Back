@@ -3,6 +3,7 @@ import cors from 'cors';
 import { env, allowedOrigins } from './config/env';
 import { errorHandler } from './middleware/errorHandler';
 import router from './routes';
+import { ensureCategories } from './services/budgetService';
 
 const app = express();
 
@@ -39,9 +40,11 @@ app.use(errorHandler);
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-app.listen(env.PORT, () => {
+app.listen(env.PORT, async () => {
   console.log(`🚀  Server running on http://localhost:${env.PORT}`);
   console.log(`   Environment: ${env.NODE_ENV}`);
+  await ensureCategories();
+  console.log(`   Categories: ready`);
 });
 
 export default app;

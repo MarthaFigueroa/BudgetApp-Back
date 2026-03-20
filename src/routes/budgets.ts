@@ -8,53 +8,32 @@ const router = Router({ mergeParams: true });
 // ─── Zod schemas ──────────────────────────────────────────────────────────────
 
 const monthYearParams = z.object({
-  year: z.coerce.number().int().min(2000).max(2100),
+  year:  z.coerce.number().int().min(2000).max(2100),
   month: z.coerce.number().int().min(1).max(12),
 });
 
 const incomeSourceBody = z.object({
-  name: z.string().min(1),
+  name:   z.string().min(1),
   amount: z.number().nonnegative(),
-  isRecurring: z.boolean().default(false),
 });
 
 const updateIncomeSourceBody = incomeSourceBody.partial();
 
 const budgetItemBody = z.object({
-  name: z.string().min(1),
-  plannedAmount: z.number().positive(),
-  actualAmount: z.number().nonnegative().optional(),
-  isPaid: z.boolean().optional(),
-  dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-  isRecurring: z.boolean().optional(),
-  recurringFrequency: z
-    .enum(['weekly', 'biweekly', 'monthly', 'quarterly', 'yearly'])
-    .optional(),
-  notes: z.string().optional(),
+  name:               z.string().min(1),
+  plannedAmount:      z.number().positive(),
+  actualAmount:       z.number().nonnegative().optional(),
+  isPaid:             z.boolean().optional(),
+  dueDate:            z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  isRecurring:        z.boolean().optional(),
+  recurringFrequency: z.enum(['weekly', 'biweekly', 'monthly', 'quarterly', 'yearly']).optional(),
+  notes:              z.string().optional(),
 });
 
-const updateItemBody = budgetItemBody
-  .partial()
-  .extend({ dueDate: z.string().nullable().optional() });
-
-const actualAmountBody = z.object({
-  amount: z.number().nonnegative(),
-});
-
-const saveBaseIncomeBody = z.object({
-  sources: z
-    .array(
-      z.object({
-        name: z.string().min(1),
-        amount: z.number().nonnegative(),
-        isRecurring: z.boolean().default(false),
-      }),
-    )
-    .min(1),
-});
+const updateItemBody   = budgetItemBody.partial().extend({ dueDate: z.string().nullable().optional() });
+const actualAmountBody = z.object({ amount: z.number().nonnegative() });
 
 // ─── GET /api/budgets/:year/:month ────────────────────────────────────────────
-// Returns the full monthly budget with computed summary
 
 router.get(
   '/:year/:month',
@@ -62,19 +41,22 @@ router.get(
   async (req, res, next) => {
     try {
       const { year, month } = req.params as unknown as { year: number; month: number };
-      const budget = await service.getOrCreateBudget(month, year);
-      const summary = service.computeSummary(budget);
+      const [budget, allCategories] = await Promise.all([
+        service.getOrCreateBudget(month, year),
+        service.getAllCategories(),
+      ]);
+      const summary = service.computeSummary(budget, allCategories);
 
       res.json({
-        id: budget.id,
-        month: budget.month,
-        year: budget.year,
+        id:        budget.id,
+        month:     budget.month,
+        year:      budget.year,
         createdAt: budget.createdAt,
         updatedAt: budget.updatedAt,
-        baseIncomeTemplate: budget.baseIncomeTemplateMonth
-          ? { month: budget.baseIncomeTemplateMonth, year: budget.baseIncomeTemplateYear }
+        template:  budget.template
+          ? { id: budget.template.id, name: budget.template.name }
           : null,
-        incomeSources: budget.incomeSources,
+        incomeSources: budget.incomeSources.map(service.toIncomeSourceDetail),
         summary,
       });
     } catch (err) {
@@ -139,18 +121,19 @@ router.delete(
   },
 );
 
-// POST /api/budgets/:year/:month/income/save-base
-// Saves current month's income sources as a base income template
-router.post(
-  '/:year/:month/income/save-base',
+// PATCH /api/budgets/:year/:month/income/:sourceId/toggle-recurring
+// Toggles whether a source is part of the recurring template or is a one-time income
+router.patch(
+  '/:year/:month/income/:sourceId/toggle-recurring',
   validate(monthYearParams, 'params'),
-  validate(saveBaseIncomeBody),
   async (req, res, next) => {
     try {
-      const { year, month } = req.params as unknown as { year: number; month: number };
-      const { sources } = req.body as { sources: { name: string; amount: number; isRecurring: boolean }[] };
-      const template = await service.saveBaseIncomeTemplate(month, year, sources);
-      res.status(201).json(template);
+      const { year, month, sourceId } = req.params as unknown as {
+        year: number; month: number; sourceId: string;
+      };
+      const budget = await service.getOrCreateBudget(month, year);
+      const source = await service.toggleRecurring(sourceId, budget.id);
+      res.json(source);
     } catch (err) {
       next(err);
     }

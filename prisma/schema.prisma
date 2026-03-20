@@ -34,53 +34,58 @@ enum RecurringFrequency {
 
 /// A complete monthly budget snapshot
 model MonthlyBudget {
-  id         String   @id @default(cuid())
-  month      Int      // 1–12
-  year       Int
-  createdAt  DateTime @default(now()) @map("created_at")
-  updatedAt  DateTime @updatedAt @map("updated_at")
+  id        String   @id @default(cuid())
+  month     Int      // 1–12
+  year      Int
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
-  // Optional: tracks which base income template was applied
-  baseIncomeTemplateMonth Int? @map("base_income_template_month")
-  baseIncomeTemplateYear  Int? @map("base_income_template_year")
+  // Which recurring-income template was applied when this budget was created
+  templateId String?         @map("template_id")
+  template   IncomeTemplate? @relation(fields: [templateId], references: [id])
 
-  incomeSources    IncomeSource[]
-  categories       BudgetCategory[]
+  incomeSources IncomeSource[]
+  items         BudgetItem[]
 
   @@unique([month, year])
   @@map("monthly_budgets")
 }
 
-/// A single income source within a monthly budget
-model IncomeSource {
-  id          String  @id @default(cuid())
-  name        String
-  amount      Float
-  isRecurring Boolean @default(false) @map("is_recurring")
-
-  budgetId String        @map("budget_id")
-  budget   MonthlyBudget @relation(fields: [budgetId], references: [id], onDelete: Cascade)
-
-  @@map("income_sources")
-}
-
-/// A spending category within a monthly budget (7 fixed types)
-model BudgetCategory {
+/// Global reference table — 7 fixed category definitions, shared across all budgets
+model Category {
   id    String       @id @default(cuid())
-  type  CategoryType
+  type  CategoryType @unique
   name  String
   icon  String
   color String
 
+  items BudgetItem[]
+
+  @@map("categories")
+}
+
+/// A single income entry for one specific month.
+/// May originate from a template (isFromTemplate=true) or be entered ad-hoc (isFromTemplate=false).
+model IncomeSource {
+  id   String @id @default(cuid())
+  name String
+  amount Float
+
+  /// true  → was copied from a template item; will propagate to future months
+  /// false → one-time income (bonus, gift, sale…); stays only in this month
+  isFromTemplate Boolean @default(false) @map("is_from_template")
+
   budgetId String        @map("budget_id")
   budget   MonthlyBudget @relation(fields: [budgetId], references: [id], onDelete: Cascade)
 
-  items BudgetItem[]
+  /// FK to the template item this was copied from (null for ad-hoc entries)
+  templateItemId String?            @map("template_item_id")
+  templateItem   IncomeTemplateItem? @relation(fields: [templateItemId], references: [id], onDelete: SetNull)
 
-  @@map("budget_categories")
+  @@map("income_sources")
 }
 
-/// An individual expense/line item within a category
+/// An individual expense/line item — belongs to a budget month AND a global category
 model BudgetItem {
   id                 String              @id @default(cuid())
   name               String
@@ -93,33 +98,40 @@ model BudgetItem {
   notes              String?
   createdAt          DateTime            @default(now()) @map("created_at")
 
-  categoryId String         @map("category_id")
-  category   BudgetCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  categoryId String   @map("category_id")
+  category   Category @relation(fields: [categoryId], references: [id])
+
+  budgetId String        @map("budget_id")
+  budget   MonthlyBudget @relation(fields: [budgetId], references: [id], onDelete: Cascade)
 
   @@map("budget_items")
 }
 
-/// A versioned base income template (effective from a given month/year)
-model BaseIncomeTemplate {
-  id                 String   @id @default(cuid())
-  effectiveFromMonth Int      @map("effective_from_month")
-  effectiveFromYear  Int      @map("effective_from_year")
-  createdAt          DateTime @default(now()) @map("created_at")
+/// A named snapshot of recurring income sources.
+/// When a new monthly budget is created the most recent template is applied automatically.
+model IncomeTemplate {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
 
-  sources BaseIncomeTemplateSource[]
+  items   IncomeTemplateItem[]
+  budgets MonthlyBudget[]
 
-  @@map("base_income_templates")
+  @@map("income_templates")
 }
 
-/// A single income source line within a base income template
-model BaseIncomeTemplateSource {
-  id          String  @id @default(cuid())
-  name        String
-  amount      Float
-  isRecurring Boolean @default(false) @map("is_recurring")
+/// One recurring income line inside a template (salary, dividends, etc.)
+model IncomeTemplateItem {
+  id                 String              @id @default(cuid())
+  name               String
+  amount             Float
+  recurringFrequency RecurringFrequency? @map("recurring_frequency")
 
-  templateId String             @map("template_id")
-  template   BaseIncomeTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  templateId String         @map("template_id")
+  template   IncomeTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
 
-  @@map("base_income_template_sources")
+  /// All monthly income sources copied from this item
+  sources IncomeSource[]
+
+  @@map("income_template_items")
 }

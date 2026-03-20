@@ -9,8 +9,12 @@ export function validate(schema: ZodSchema, target: Target = 'body') {
     if (!result.success) {
       return next(result.error);
     }
-    // Replace the target with the parsed (coerced/defaulted) data
-    (req as unknown as Record<string, unknown>)[target] = result.data;
+    // Merge parsed data (coerced/defaulted) into the existing target,
+    // so other params like :sourceId / :categoryId / :itemId are preserved.
+    (req as unknown as Record<string, unknown>)[target] = {
+      ...(req[target] as Record<string, unknown>),
+      ...result.data,
+    };
     next();
   };
 }

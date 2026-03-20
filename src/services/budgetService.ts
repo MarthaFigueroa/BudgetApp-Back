@@ -1,9 +1,14 @@
-import { BudgetItem, BudgetCategory, RecurringFrequency } from '@prisma/client';
+import { BudgetItem, Category, RecurringFrequency, Prisma } from '@prisma/client';
 import prisma from '../config/prisma';
-import { CATEGORY_DEFAULTS, BudgetSummary, CategorySummary, ItemDetail } from '../types';
+import { BudgetSummary, CategorySummary, ItemDetail } from '../types';
 import { AppError } from '../middleware/errorHandler';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const MONTH_NAMES = [
+  'Enero','Febrero','Marzo','Abril','Mayo','Junio',
+  'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre',
+];
 
 function occurrencesPerMonth(frequency?: RecurringFrequency | null): number {
   if (frequency === 'weekly') return 4;
@@ -13,161 +18,340 @@ function occurrencesPerMonth(frequency?: RecurringFrequency | null): number {
 
 function toItemDetail(item: BudgetItem): ItemDetail {
   return {
-    id: item.id,
-    name: item.name,
-    plannedAmount: item.plannedAmount,
-    actualAmount: item.actualAmount,
-    isPaid: item.isPaid,
-    dueDate: item.dueDate ? item.dueDate.toISOString().split('T')[0] : null,
-    isRecurring: item.isRecurring,
+    id:                 item.id,
+    name:               item.name,
+    plannedAmount:      item.plannedAmount,
+    actualAmount:       item.actualAmount,
+    isPaid:             item.isPaid,
+    dueDate:            item.dueDate ? item.dueDate.toISOString().split('T')[0] : null,
+    isRecurring:        item.isRecurring,
     recurringFrequency: item.recurringFrequency,
-    notes: item.notes,
-    createdAt: item.createdAt.toISOString(),
+    notes:              item.notes,
+    createdAt:          item.createdAt.toISOString(),
   };
+}
+
+// ─── Global categories ────────────────────────────────────────────────────────
+
+const CATEGORY_DEFAULTS: {
+  type: import('@prisma/client').CategoryType;
+  name: string; icon: string; color: string;
+}[] = [
+  { type: 'housing',       name: 'Vivienda',          icon: '🏠', color: '#7C9EFF' },
+  { type: 'utilities',     name: 'Servicios básicos',  icon: '⚡', color: '#FFD166' },
+  { type: 'savings',       name: 'Ahorros',            icon: '💎', color: '#C9F131' },
+  { type: 'unexpected',    name: 'Imprevistos',        icon: '🛡️', color: '#FF7B7B' },
+  { type: 'personal',      name: 'Ocio y personal',    icon: '✨', color: '#B4A7FF' },
+  { type: 'investments',   name: 'Inversiones',        icon: '📈', color: '#4DFFB4' },
+  { type: 'subscriptions', name: 'Suscripciones',      icon: '📱', color: '#FF9F4A' },
+];
+
+/** Upserts the 7 global categories. Called on server startup. */
+export async function ensureCategories(): Promise<void> {
+  for (const cat of CATEGORY_DEFAULTS) {
+    await prisma.category.upsert({
+      where:  { type: cat.type },
+      update: { name: cat.name, icon: cat.icon, color: cat.color },
+      create: cat,
+    });
+  }
+}
+
+export async function getAllCategories(): Promise<Category[]> {
+  return prisma.category.findMany({ orderBy: { type: 'asc' } });
 }
 
 // ─── Budget retrieval / creation ──────────────────────────────────────────────
 
-export async function getOrCreateBudget(month: number, year: number) {
+const BUDGET_INCLUDE = {
+  template: true,
+  incomeSources: { include: { templateItem: true } },
+  items: { include: { category: true }, orderBy: { createdAt: 'asc' as const } },
+} satisfies Prisma.MonthlyBudgetInclude;
+
+export type BudgetWithRelations = Prisma.MonthlyBudgetGetPayload<{
+  include: typeof BUDGET_INCLUDE;
+}>;
+
+export type IncomeSourceWithTemplate = BudgetWithRelations['incomeSources'][number];
+
+/** Serialises an income source for the API response, including the recurring frequency from its template item. */
+export function toIncomeSourceDetail(src: IncomeSourceWithTemplate) {
+  return {
+    id:                 src.id,
+    name:               src.name,
+    amount:             src.amount,
+    isFromTemplate:     src.isFromTemplate,
+    templateItemId:     src.templateItemId ?? null,
+    recurringFrequency: src.templateItem?.recurringFrequency ?? null,
+    budgetId:           src.budgetId,
+  };
+}
+
+export async function getOrCreateBudget(month: number, year: number): Promise<BudgetWithRelations> {
   let budget = await prisma.monthlyBudget.findUnique({
-    where: { month_year: { month, year } },
-    include: {
-      incomeSources: true,
-      categories: { include: { items: { orderBy: { createdAt: 'asc' } } } },
-    },
+    where:   { month_year: { month, year } },
+    include: BUDGET_INCLUDE,
   });
 
   if (!budget) {
-    // Apply the most recent base income template if available
-    const templates = await prisma.baseIncomeTemplate.findMany({
-      include: { sources: true },
-      orderBy: [{ effectiveFromYear: 'desc' }, { effectiveFromMonth: 'desc' }],
+    // Apply the most recently created template
+    const activeTemplate = await prisma.incomeTemplate.findFirst({
+      include: { items: true },
+      orderBy: { createdAt: 'desc' },
     });
 
-    const applicableTemplate = templates.find(
-      (t) =>
-        t.effectiveFromYear < year ||
-        (t.effectiveFromYear === year && t.effectiveFromMonth <= month),
-    );
+    try {
+      budget = await prisma.monthlyBudget.create({
+        data: {
+          month,
+          year,
+          templateId: activeTemplate?.id ?? null,
+          incomeSources: {
+            create: activeTemplate
+              ? activeTemplate.items.map((item) => ({
+                  name:           item.name,
+                  amount:         item.amount,
+                  isFromTemplate: true,
+                  templateItemId: item.id,
+                }))
+              : [{ name: 'Salario neto', amount: 0, isFromTemplate: false }],
+          },
+        },
+        include: BUDGET_INCLUDE,
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        budget = await prisma.monthlyBudget.findUniqueOrThrow({
+          where:   { month_year: { month, year } },
+          include: BUDGET_INCLUDE,
+        });
+      } else {
+        throw err;
+      }
+    }
+  }
 
-    budget = await prisma.monthlyBudget.create({
+  // Sync any template items that this budget is missing (handles existing budgets
+  // when new recurring incomes are added to the template after the budget was created).
+  await syncIncomeTemplateItems(budget);
+  await syncRecurringFromPreviousMonths(budget);
+
+  return prisma.monthlyBudget.findUniqueOrThrow({
+    where:   { month_year: { month, year } },
+    include: BUDGET_INCLUDE,
+  });
+}
+
+/**
+ * For an existing budget, ensures it has one income source per template item.
+ * - If the budget has a templateId → adds any missing sources for that template.
+ * - If the budget has no templateId AND no income sources (created bare by
+ *   propagateRecurring) → adopts the most recent template and creates its sources.
+ */
+async function syncIncomeTemplateItems(budget: BudgetWithRelations): Promise<void> {
+  let templateId = budget.templateId;
+
+  // Adopt the latest template for bare budgets (created without income sources)
+  if (!templateId && budget.incomeSources.length === 0) {
+    const latest = await prisma.incomeTemplate.findFirst({
+      orderBy: { createdAt: 'desc' },
+    });
+    if (latest) {
+      templateId = latest.id;
+      await prisma.monthlyBudget.update({
+        where: { id: budget.id },
+        data:  { templateId },
+      });
+    }
+  }
+
+  if (!templateId) return;
+
+  const template = await prisma.incomeTemplate.findUnique({
+    where:   { id: templateId },
+    include: { items: true },
+  });
+  if (!template || template.items.length === 0) return;
+
+  // Build set of template item IDs already covered by this budget's income sources
+  const coveredItemIds = new Set(
+    budget.incomeSources
+      .filter((s) => s.templateItemId !== null)
+      .map((s) => s.templateItemId as string),
+  );
+
+  for (const item of template.items) {
+    if (coveredItemIds.has(item.id)) continue;
+    await prisma.incomeSource.create({
       data: {
-        month,
-        year,
-        baseIncomeTemplateMonth: applicableTemplate?.effectiveFromMonth ?? null,
-        baseIncomeTemplateYear: applicableTemplate?.effectiveFromYear ?? null,
-        incomeSources: {
-          create: applicableTemplate
-            ? applicableTemplate.sources.map((s) => ({
-                name: s.name,
-                amount: s.amount,
-                isRecurring: s.isRecurring,
-              }))
-            : [],
-        },
-        categories: {
-          create: CATEGORY_DEFAULTS.map((c) => ({
-            type: c.type,
-            name: c.name,
-            icon: c.icon,
-            color: c.color,
-          })),
-        },
-      },
-      include: {
-        incomeSources: true,
-        categories: { include: { items: true } },
+        name:           item.name,
+        amount:         item.amount,
+        isFromTemplate: true,
+        templateItemId: item.id,
+        budgetId:       budget.id,
       },
     });
   }
+}
 
-  return budget;
+// ─── Recurring sync on navigation ─────────────────────────────────────────────
+
+async function syncRecurringFromPreviousMonths(budget: BudgetWithRelations) {
+  const { month, year, id: budgetId } = budget;
+
+  const lookbacks: { distances: number[]; frequencies: string[] }[] = [
+    { distances: [1, 2, 3], frequencies: ['monthly', 'biweekly', 'weekly'] },
+    { distances: [3, 6],    frequencies: ['quarterly'] },
+    { distances: [12],      frequencies: ['yearly'] },
+  ];
+
+  for (const { distances, frequencies } of lookbacks) {
+    for (const distance of distances) {
+      let srcM = month - distance;
+      let srcY = year;
+      while (srcM < 1) { srcM += 12; srcY--; }
+
+      const srcBudget = await prisma.monthlyBudget.findUnique({
+        where:   { month_year: { month: srcM, year: srcY } },
+        include: { items: true },
+      });
+      if (!srcBudget) continue;
+
+      const recurringItems = srcBudget.items.filter(
+        (i) => i.isRecurring && i.recurringFrequency && frequencies.includes(i.recurringFrequency),
+      );
+
+      for (const item of recurringItems) {
+        const exists = await prisma.budgetItem.findFirst({
+          where: { budgetId, categoryId: item.categoryId, name: item.name, isRecurring: true },
+        });
+        if (exists) continue;
+
+        await prisma.budgetItem.create({
+          data: {
+            name:               item.name,
+            plannedAmount:      item.plannedAmount,
+            actualAmount:       0,
+            isPaid:             false,
+            dueDate:            item.dueDate,
+            isRecurring:        true,
+            recurringFrequency: item.recurringFrequency,
+            notes:              item.notes,
+            categoryId:         item.categoryId,
+            budgetId,
+          },
+        });
+      }
+    }
+  }
 }
 
 // ─── Summary computation ──────────────────────────────────────────────────────
 
-type BudgetWithRelations = Awaited<ReturnType<typeof getOrCreateBudget>>;
-
-export function computeSummary(budget: BudgetWithRelations): BudgetSummary {
+export function computeSummary(budget: BudgetWithRelations, allCategories: Category[]): BudgetSummary {
   const totalIncome = budget.incomeSources.reduce((s, src) => s + src.amount, 0);
 
-  const categories: CategorySummary[] = budget.categories.map((cat) => {
-    const items = cat.items;
-
+  const categories: CategorySummary[] = allCategories.map((cat) => {
+    const items       = budget.items.filter((i) => i.categoryId === cat.id);
     const totalPlanned = items.reduce(
-      (s, i) => s + i.plannedAmount * occurrencesPerMonth(i.recurringFrequency),
-      0,
+      (s, i) => s + i.plannedAmount * occurrencesPerMonth(i.recurringFrequency), 0,
     );
-    const totalActual = items.reduce((s, i) => s + i.actualAmount, 0);
-    const paidCount = items.filter((i) => i.isPaid).length;
+    const totalActual  = items.reduce((s, i) => s + i.actualAmount, 0);
+    const paidCount    = items.filter((i) => i.isPaid).length;
     const pendingCount = items.length - paidCount;
 
-    const percentageOfIncome = totalIncome > 0 ? (totalPlanned / totalIncome) * 100 : 0;
-
     return {
-      id: cat.id,
-      type: cat.type,
-      name: cat.name,
-      icon: cat.icon,
-      color: cat.color,
-      totalPlanned,
-      totalActual,
-      percentageOfIncome,
-      percentageOfBudget: 0, // Filled below after we know totalPlanned
+      id: cat.id, type: cat.type, name: cat.name, icon: cat.icon, color: cat.color,
+      totalPlanned, totalActual,
+      percentageOfIncome: totalIncome > 0 ? (totalPlanned / totalIncome) * 100 : 0,
+      percentageOfBudget: 0,
       variance: totalActual - totalPlanned,
-      paidCount,
-      pendingCount,
+      paidCount, pendingCount,
       items: items.map(toItemDetail),
     };
   });
 
   const totalPlanned = categories.reduce((s, c) => s + c.totalPlanned, 0);
-  const totalActual = categories.reduce((s, c) => s + c.totalActual, 0);
-
-  // Fill percentageOfBudget now that totalPlanned is known
+  const totalActual  = categories.reduce((s, c) => s + c.totalActual, 0);
   categories.forEach((c) => {
     c.percentageOfBudget = totalPlanned > 0 ? (c.totalPlanned / totalPlanned) * 100 : 0;
   });
 
-  const savingsAmount =
-    categories.find((c) => c.type === 'savings')?.totalPlanned ?? 0;
-  const investmentAmount =
-    categories.find((c) => c.type === 'investments')?.totalPlanned ?? 0;
-  const spendingAmount = totalPlanned - savingsAmount - investmentAmount;
+  const savingsAmount    = categories.find((c) => c.type === 'savings')?.totalPlanned    ?? 0;
+  const investmentAmount = categories.find((c) => c.type === 'investments')?.totalPlanned ?? 0;
 
   return {
-    totalIncome,
-    totalPlanned,
-    totalActual,
-    unallocated: totalIncome - totalPlanned,
+    totalIncome, totalPlanned, totalActual,
+    unallocated:          totalIncome - totalPlanned,
     savingsAmount,
-    savingsRate: totalIncome > 0 ? (savingsAmount / totalIncome) * 100 : 0,
-    spendingAmount,
+    savingsRate:          totalIncome > 0 ? (savingsAmount / totalIncome) * 100 : 0,
+    spendingAmount:       totalPlanned - savingsAmount - investmentAmount,
     investmentAmount,
-    isOverBudget: totalIncome > 0 && totalPlanned > totalIncome,
+    isOverBudget:         totalIncome > 0 && totalPlanned > totalIncome,
     allocationPercentage: totalIncome > 0 ? (totalPlanned / totalIncome) * 100 : 0,
-    executionRate: totalPlanned > 0 ? (totalActual / totalPlanned) * 100 : 0,
+    executionRate:        totalPlanned > 0 ? (totalActual / totalPlanned) * 100 : 0,
     categories,
   };
 }
 
 // ─── Income source operations ─────────────────────────────────────────────────
 
-export async function addIncomeSource(
-  budgetId: string,
-  data: { name: string; amount: number; isRecurring: boolean },
-) {
-  return prisma.incomeSource.create({ data: { ...data, budgetId } });
+export async function addIncomeSource(budgetId: string, data: { name: string; amount: number }) {
+  const src = await prisma.incomeSource.create({
+    data:    { ...data, isFromTemplate: false, budgetId },
+    include: { templateItem: true },
+  });
+  return toIncomeSourceDetail(src);
 }
 
 export async function updateIncomeSource(
   id: string,
   budgetId: string,
-  data: Partial<{ name: string; amount: number; isRecurring: boolean }>,
+  data: Partial<{ name: string; amount: number }>,
 ) {
   const existing = await prisma.incomeSource.findFirst({ where: { id, budgetId } });
   if (!existing) throw new AppError(404, 'Income source not found');
-  return prisma.incomeSource.update({ where: { id }, data });
+
+  const src = await prisma.incomeSource.update({
+    where:   { id },
+    data,
+    include: { templateItem: true },
+  });
+
+  // Build a clean update object (skip undefined fields to avoid Prisma issues)
+  const templatePatch: Partial<{ name: string; amount: number }> = {};
+  if (data.name   !== undefined) templatePatch.name   = data.name;
+  if (data.amount !== undefined) templatePatch.amount = data.amount;
+
+  if (existing.templateItemId && Object.keys(templatePatch).length > 0) {
+    // 1. Update the template item → new months created after this will inherit updated values
+    await prisma.incomeTemplateItem.update({
+      where: { id: existing.templateItemId },
+      data:  templatePatch,
+    });
+
+    // 2. Propagate to existing income_sources in future months that share the same template item.
+    //    We only update FUTURE months (not past) to preserve historical data.
+    const currentBudget = await prisma.monthlyBudget.findUnique({ where: { id: budgetId } });
+    if (currentBudget) {
+      await prisma.incomeSource.updateMany({
+        where: {
+          templateItemId: existing.templateItemId,
+          id:             { not: id },          // skip the source we already updated above
+          budget: {
+            OR: [
+              { year: { gt: currentBudget.year } },
+              { year: currentBudget.year, month: { gt: currentBudget.month } },
+            ],
+          },
+        },
+        data: templatePatch,
+      });
+    }
+  }
+
+  return toIncomeSourceDetail(src);
 }
 
 export async function removeIncomeSource(id: string, budgetId: string) {
@@ -176,255 +360,217 @@ export async function removeIncomeSource(id: string, budgetId: string) {
   await prisma.incomeSource.delete({ where: { id } });
 }
 
+/**
+ * Toggles whether an income source is recurring (part of the template) or one-time.
+ *
+ * Toggle ON  → creates a template item, links this source to it
+ * Toggle OFF → removes the template item, unlinks the source
+ */
+export async function toggleRecurring(sourceId: string, budgetId: string) {
+  const src = await prisma.incomeSource.findFirst({
+    where:   { id: sourceId, budgetId },
+    include: { templateItem: true },
+  });
+  if (!src) throw new AppError(404, 'Income source not found');
+
+  if (src.isFromTemplate && src.templateItemId) {
+    // ── Toggle OFF: remove from template ────────────────────────────────────
+    await prisma.incomeTemplateItem.delete({ where: { id: src.templateItemId } });
+    const updated = await prisma.incomeSource.update({
+      where:   { id: sourceId },
+      data:    { isFromTemplate: false, templateItemId: null },
+      include: { templateItem: true },
+    });
+    return toIncomeSourceDetail(updated);
+  }
+
+  // ── Toggle ON: add to the budget's template (create template if needed) ──
+  const budget = await prisma.monthlyBudget.findUnique({ where: { id: budgetId } });
+  if (!budget) throw new AppError(404, 'Budget not found');
+
+  let templateId = budget.templateId;
+
+  if (!templateId) {
+    // Create a new template named after this month/year
+    const template = await prisma.incomeTemplate.create({
+      data: { name: `Plantilla ${MONTH_NAMES[budget.month - 1]} ${budget.year}` },
+    });
+    templateId = template.id;
+    await prisma.monthlyBudget.update({ where: { id: budgetId }, data: { templateId } });
+  }
+
+  const templateItem = await prisma.incomeTemplateItem.create({
+    data: { name: src.name, amount: src.amount, templateId },
+  });
+
+  const updated = await prisma.incomeSource.update({
+    where:   { id: sourceId },
+    data:    { isFromTemplate: true, templateItemId: templateItem.id },
+    include: { templateItem: true },
+  });
+
+  // Propagate to existing future months that share the same template
+  const futureBudgets = await prisma.monthlyBudget.findMany({
+    where: {
+      templateId,
+      OR: [
+        { year: { gt: budget.year } },
+        { year: budget.year, month: { gt: budget.month } },
+      ],
+    },
+  });
+  for (const future of futureBudgets) {
+    const exists = await prisma.incomeSource.findFirst({
+      where: { budgetId: future.id, templateItemId: templateItem.id },
+    });
+    if (!exists) {
+      await prisma.incomeSource.create({
+        data: {
+          name:           src.name,
+          amount:         src.amount,
+          isFromTemplate: true,
+          templateItemId: templateItem.id,
+          budgetId:       future.id,
+        },
+      });
+    }
+  }
+
+  return toIncomeSourceDetail(updated);
+}
+
 // ─── Budget item operations ───────────────────────────────────────────────────
 
 export async function addItem(
   categoryId: string,
   budgetId: string,
   data: {
-    name: string;
-    plannedAmount: number;
-    actualAmount?: number;
-    isPaid?: boolean;
-    dueDate?: string;
-    isRecurring?: boolean;
-    recurringFrequency?: RecurringFrequency;
-    notes?: string;
+    name: string; plannedAmount: number; actualAmount?: number; isPaid?: boolean;
+    dueDate?: string; isRecurring?: boolean; recurringFrequency?: RecurringFrequency; notes?: string;
   },
 ) {
-  const category = await prisma.budgetCategory.findFirst({
-    where: { id: categoryId, budgetId },
-  });
+  const category = await prisma.category.findUnique({ where: { id: categoryId } });
   if (!category) throw new AppError(404, 'Category not found');
 
   const item = await prisma.budgetItem.create({
     data: {
-      name: data.name,
-      plannedAmount: data.plannedAmount,
-      actualAmount: data.actualAmount ?? 0,
-      isPaid: data.isPaid ?? false,
+      name: data.name, plannedAmount: data.plannedAmount,
+      actualAmount: data.actualAmount ?? 0, isPaid: data.isPaid ?? false,
       dueDate: data.dueDate ? new Date(data.dueDate) : null,
-      isRecurring: data.isRecurring ?? false,
-      recurringFrequency: data.recurringFrequency ?? null,
-      notes: data.notes ?? null,
-      categoryId,
+      isRecurring: data.isRecurring ?? false, recurringFrequency: data.recurringFrequency ?? null,
+      notes: data.notes ?? null, categoryId, budgetId,
     },
   });
 
-  // Propagate to future months if recurring
   if (item.isRecurring && item.recurringFrequency) {
-    const budget = await prisma.monthlyBudget.findUnique({
-      where: { id: budgetId },
-    });
-    if (budget) {
-      await propagateRecurring(item, category, budget.month, budget.year);
-    }
+    const budget = await prisma.monthlyBudget.findUnique({ where: { id: budgetId } });
+    if (budget) await propagateRecurring(item, budget.month, budget.year);
   }
 
   return item;
 }
 
 export async function updateItem(
-  itemId: string,
-  categoryId: string,
-  budgetId: string,
+  itemId: string, categoryId: string, budgetId: string,
   data: Partial<{
-    name: string;
-    plannedAmount: number;
-    actualAmount: number;
-    isPaid: boolean;
-    dueDate: string | null;
-    isRecurring: boolean;
-    recurringFrequency: RecurringFrequency | null;
-    notes: string | null;
+    name: string; plannedAmount: number; actualAmount: number; isPaid: boolean;
+    dueDate: string | null; isRecurring: boolean; recurringFrequency: RecurringFrequency | null; notes: string | null;
   }>,
 ) {
-  const existing = await prisma.budgetItem.findFirst({
-    where: { id: itemId, categoryId, category: { budgetId } },
-  });
+  const existing = await prisma.budgetItem.findFirst({ where: { id: itemId, categoryId, budgetId } });
   if (!existing) throw new AppError(404, 'Budget item not found');
-
   return prisma.budgetItem.update({
     where: { id: itemId },
-    data: {
+    data:  {
       ...data,
-      dueDate: data.dueDate !== undefined
-        ? data.dueDate ? new Date(data.dueDate) : null
-        : undefined,
+      dueDate: data.dueDate !== undefined ? (data.dueDate ? new Date(data.dueDate) : null) : undefined,
     },
   });
 }
 
 export async function removeItem(itemId: string, categoryId: string, budgetId: string) {
-  const existing = await prisma.budgetItem.findFirst({
-    where: { id: itemId, categoryId, category: { budgetId } },
-  });
+  const existing = await prisma.budgetItem.findFirst({ where: { id: itemId, categoryId, budgetId } });
   if (!existing) throw new AppError(404, 'Budget item not found');
   await prisma.budgetItem.delete({ where: { id: itemId } });
 }
 
 export async function togglePaid(itemId: string, categoryId: string, budgetId: string) {
-  const existing = await prisma.budgetItem.findFirst({
-    where: { id: itemId, categoryId, category: { budgetId } },
-  });
+  const existing = await prisma.budgetItem.findFirst({ where: { id: itemId, categoryId, budgetId } });
   if (!existing) throw new AppError(404, 'Budget item not found');
-
   return prisma.budgetItem.update({
     where: { id: itemId },
     data: {
-      isPaid: !existing.isPaid,
-      // Auto-set actualAmount to plannedAmount when marking as paid (if not yet set)
-      actualAmount:
-        !existing.isPaid && existing.actualAmount === 0
-          ? existing.plannedAmount
-          : existing.actualAmount,
+      isPaid:       !existing.isPaid,
+      actualAmount: !existing.isPaid && existing.actualAmount === 0
+        ? existing.plannedAmount : existing.actualAmount,
     },
   });
 }
 
 export async function updateActualAmount(
-  itemId: string,
-  categoryId: string,
-  budgetId: string,
-  amount: number,
+  itemId: string, categoryId: string, budgetId: string, amount: number,
 ) {
-  const existing = await prisma.budgetItem.findFirst({
-    where: { id: itemId, categoryId, category: { budgetId } },
-  });
+  const existing = await prisma.budgetItem.findFirst({ where: { id: itemId, categoryId, budgetId } });
   if (!existing) throw new AppError(404, 'Budget item not found');
   return prisma.budgetItem.update({ where: { id: itemId }, data: { actualAmount: amount } });
 }
 
 // ─── Recurring propagation ────────────────────────────────────────────────────
 
-async function propagateRecurring(
-  item: BudgetItem,
-  sourceCategory: BudgetCategory,
-  sourceMonth: number,
-  sourceYear: number,
-) {
+async function propagateRecurring(item: BudgetItem, sourceMonth: number, sourceYear: number) {
   const targets = getRecurringTargets(sourceMonth, sourceYear, item.recurringFrequency!);
-
   for (const { month, year } of targets) {
-    // Get or create the target monthly budget
-    let targetBudget = await prisma.monthlyBudget.findUnique({
-      where: { month_year: { month, year } },
-      include: { categories: true },
-    });
-
+    let targetBudget = await prisma.monthlyBudget.findUnique({ where: { month_year: { month, year } } });
     if (!targetBudget) {
-      targetBudget = await prisma.monthlyBudget.create({
-        data: {
-          month,
-          year,
-          categories: {
-            create: CATEGORY_DEFAULTS.map((c) => ({
-              type: c.type,
-              name: c.name,
-              icon: c.icon,
-              color: c.color,
-            })),
-          },
-        },
-        include: { categories: true },
-      });
+      try {
+        targetBudget = await prisma.monthlyBudget.create({ data: { month, year } });
+      } catch (err) {
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+          targetBudget = await prisma.monthlyBudget.findUniqueOrThrow({ where: { month_year: { month, year } } });
+        } else { throw err; }
+      }
     }
-
-    const targetCategory = targetBudget.categories.find(
-      (c) => c.type === sourceCategory.type,
-    );
-    if (!targetCategory) continue;
-
-    // Avoid duplicates: skip if item with same name already exists
     const duplicate = await prisma.budgetItem.findFirst({
-      where: { categoryId: targetCategory.id, name: item.name },
+      where: { budgetId: targetBudget.id, categoryId: item.categoryId, name: item.name },
     });
     if (duplicate) continue;
-
     await prisma.budgetItem.create({
       data: {
-        name: item.name,
-        plannedAmount: item.plannedAmount,
-        actualAmount: 0,
-        isPaid: false,
-        dueDate: item.dueDate,
-        isRecurring: true,
-        recurringFrequency: item.recurringFrequency,
-        notes: item.notes,
-        categoryId: targetCategory.id,
+        name: item.name, plannedAmount: item.plannedAmount, actualAmount: 0, isPaid: false,
+        dueDate: item.dueDate, isRecurring: true, recurringFrequency: item.recurringFrequency,
+        notes: item.notes, categoryId: item.categoryId, budgetId: targetBudget.id,
       },
     });
   }
 }
 
-function getRecurringTargets(
-  month: number,
-  year: number,
-  frequency: RecurringFrequency,
-): { month: number; year: number }[] {
+function getRecurringTargets(month: number, year: number, frequency: RecurringFrequency) {
   const targets: { month: number; year: number }[] = [];
-
   if (frequency === 'weekly' || frequency === 'biweekly' || frequency === 'monthly') {
-    // Propagate to next 11 months
     for (let i = 1; i <= 11; i++) {
-      const m = ((month - 1 + i) % 12) + 1;
-      const y = year + Math.floor((month - 1 + i) / 12);
-      targets.push({ month: m, year: y });
+      targets.push({ month: ((month - 1 + i) % 12) + 1, year: year + Math.floor((month - 1 + i) / 12) });
     }
   } else if (frequency === 'quarterly') {
-    // Next 3 quarters
     for (let i = 1; i <= 3; i++) {
-      const m = ((month - 1 + i * 3) % 12) + 1;
-      const y = year + Math.floor((month - 1 + i * 3) / 12);
-      targets.push({ month: m, year: y });
+      targets.push({ month: ((month - 1 + i * 3) % 12) + 1, year: year + Math.floor((month - 1 + i * 3) / 12) });
     }
   } else if (frequency === 'yearly') {
     targets.push({ month, year: year + 1 });
   }
-
   return targets;
 }
 
-// ─── Base income template operations ─────────────────────────────────────────
+// ─── Income template operations ───────────────────────────────────────────────
 
-export async function getAllBaseIncomeTemplates() {
-  return prisma.baseIncomeTemplate.findMany({
-    include: { sources: true },
-    orderBy: [{ effectiveFromYear: 'desc' }, { effectiveFromMonth: 'desc' }],
+export async function getAllTemplates() {
+  return prisma.incomeTemplate.findMany({
+    include: { items: true },
+    orderBy: { createdAt: 'desc' },
   });
 }
 
-export async function saveBaseIncomeTemplate(
-  month: number,
-  year: number,
-  sources: { name: string; amount: number; isRecurring: boolean }[],
-) {
-  // Upsert by effective month/year
-  const existing = await prisma.baseIncomeTemplate.findFirst({
-    where: { effectiveFromMonth: month, effectiveFromYear: year },
-  });
-
-  if (existing) {
-    await prisma.baseIncomeTemplateSource.deleteMany({
-      where: { templateId: existing.id },
-    });
-    return prisma.baseIncomeTemplate.update({
-      where: { id: existing.id },
-      data: { sources: { create: sources } },
-      include: { sources: true },
-    });
-  }
-
-  return prisma.baseIncomeTemplate.create({
-    data: {
-      effectiveFromMonth: month,
-      effectiveFromYear: year,
-      sources: { create: sources },
-    },
-    include: { sources: true },
-  });
-}
-
-export async function clearAllBaseIncomeTemplates() {
-  await prisma.baseIncomeTemplate.deleteMany();
+export async function deleteTemplate(id: string) {
+  const existing = await prisma.incomeTemplate.findUnique({ where: { id } });
+  if (!existing) throw new AppError(404, 'Template not found');
+  await prisma.incomeTemplate.delete({ where: { id } });
 }

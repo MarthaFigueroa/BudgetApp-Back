@@ -3,25 +3,6 @@ import { CategoryType, RecurringFrequency } from '@prisma/client';
 // Re-export Prisma enums for convenience
 export { CategoryType, RecurringFrequency };
 
-// ─── Category defaults ────────────────────────────────────────────────────────
-
-export interface CategoryDefault {
-  type: CategoryType;
-  name: string;
-  icon: string;
-  color: string;
-}
-
-export const CATEGORY_DEFAULTS: CategoryDefault[] = [
-  { type: 'housing',       name: 'Vivienda',          icon: '🏠', color: '#7C9EFF' },
-  { type: 'utilities',     name: 'Servicios básicos',  icon: '⚡', color: '#FFD166' },
-  { type: 'savings',       name: 'Ahorros',            icon: '💎', color: '#C9F131' },
-  { type: 'unexpected',    name: 'Imprevistos',        icon: '🛡️', color: '#FF7B7B' },
-  { type: 'personal',      name: 'Ocio y personal',   icon: '✨', color: '#B4A7FF' },
-  { type: 'investments',   name: 'Inversiones',        icon: '📈', color: '#4DFFB4' },
-  { type: 'subscriptions', name: 'Suscripciones',     icon: '📱', color: '#FF9F4A' },
-];
-
 // ─── Computed summary types (returned by API) ─────────────────────────────────
 
 export interface CategorySummary {
