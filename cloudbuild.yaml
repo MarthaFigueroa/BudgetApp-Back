@@ -1,14 +1,7 @@
 substitutions:
   _REGION: europe-west1
   _SERVICE: budget-back
-  _REPO: budget-app-back                # Artifact Registry repository name
-
-  # ── Runtime env vars ──────────────────────────────────────────────────────
-  # Sensitive values (DATABASE_URL) should be stored in Secret Manager and
-  # referenced in the Cloud Run service, NOT hardcoded here.
-  # _PORT: "3000"
-  _NODE_ENV: production
-  _CORS_ORIGINS: https://budget-front-<hash>-uc.a.run.app  # replace with real URL
+  _REPO: budget-app-back
 
 steps:
   # ── 1. Build Docker image ──────────────────────────────────────────────────
@@ -34,19 +27,8 @@ steps:
       - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}
 
   # ── 3. Deploy to Cloud Run ─────────────────────────────────────────────────
-  # DATABASE_URL se lee de Secret Manager en tiempo de ejecución.
-  # Crea el secreto una sola vez:
-  #   gcloud secrets create BudgetApp-DB \
-  #     --replication-policy=automatic \
-  #     --project=$PROJECT_ID
-  #   echo -n "postgresql://user:pass@host/db?sslmode=require" | \
-  #     gcloud secrets versions add BudgetApp-DB --data-file=- --project=$PROJECT_ID
-  #
-  # Otorga acceso a la Service Account de Cloud Run:
-  #   gcloud secrets add-iam-policy-binding BudgetApp-DB \
-  #     --member=serviceAccount:<PROJECT_NUMBER>-compute@developer.gserviceaccount.com \
-  #     --role=roles/secretmanager.secretAccessor \
-  #     --project=$PROJECT_ID
+  # DATABASE_URL y CORS_ORIGINS se inyectan en tiempo de ejecución desde
+  # Secret Manager mediante --update-secrets (no viajan en la imagen).
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     id: deploy
     waitFor: [push]
@@ -61,8 +43,8 @@ steps:
       - --allow-unauthenticated
       - --min-instances=0
       - --max-instances=1
-      - --set-env-vars=NODE_ENV=${_NODE_ENV},CORS_ORIGINS=${_CORS_ORIGINS}
-      - --update-secrets=DATABASE_URL=BudgetApp-DB:latest
+      - --set-env-vars=NODE_ENV=production
+      - --update-secrets=DATABASE_URL=BudgetApp-DB:latest,CORS_ORIGINS=BUDGET_FRONT_URL:latest
 
 images:
   - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
