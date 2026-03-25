@@ -6,7 +6,7 @@ substitutions:
   # ── Runtime env vars ──────────────────────────────────────────────────────
   # Sensitive values (DATABASE_URL) should be stored in Secret Manager and
   # referenced in the Cloud Run service, NOT hardcoded here.
-  _PORT: "3000"
+  # _PORT: "3000"
   _NODE_ENV: production
   _CORS_ORIGINS: https://budget-front-<hash>-uc.a.run.app  # replace with real URL
 
@@ -50,10 +50,9 @@ steps:
       - --region=${_REGION}
       - --platform=managed
       - --allow-unauthenticated
-      - --port=${_PORT}
       - --min-instances=0
       - --max-instances=1
-      - --set-env-vars=NODE_ENV=${_NODE_ENV},PORT=${_PORT},CORS_ORIGINS=${_CORS_ORIGINS}
+      - --set-env-vars=NODE_ENV=${_NODE_ENV},CORS_ORIGINS=${_CORS_ORIGINS}
       - --update-secrets=DATABASE_URL=DATABASE_URL:latest
 
 images:
