@@ -1,0 +1,65 @@
+substitutions:
+  _REGION: europe-west1
+  _SERVICE: budget-back
+  _REPO: budget-app                  # Artifact Registry repository name
+
+  # ── Runtime env vars ──────────────────────────────────────────────────────
+  # Sensitive values (DATABASE_URL) should be stored in Secret Manager and
+  # referenced in the Cloud Run service, NOT hardcoded here.
+  _PORT: "3000"
+  _NODE_ENV: production
+  _CORS_ORIGINS: https://budget-front-<hash>-uc.a.run.app  # replace with real URL
+
+steps:
+  # ── 1. Build Docker image ──────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - --tag
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - --tag
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+      - --cache-from
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+      - .
+
+  # ── 2. Push image to Artifact Registry ────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push
+    waitFor: [build]
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}
+
+  # ── 3. Deploy to Cloud Run ─────────────────────────────────────────────────
+  # DATABASE_URL is read from Secret Manager at runtime:
+  #   gcloud secrets create DATABASE_URL --data-file=- <<< "postgresql://..."
+  #   Then grant access: gcloud secrets add-iam-policy-binding DATABASE_URL \
+  #     --member=serviceAccount:<run-sa>@... --role=roles/secretmanager.secretAccessor
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: deploy
+    waitFor: [push]
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=${_PORT}
+      - --min-instances=0
+      - --max-instances=1
+      - --set-env-vars=NODE_ENV=${_NODE_ENV},PORT=${_PORT},CORS_ORIGINS=${_CORS_ORIGINS}
+      - --update-secrets=DATABASE_URL=DATABASE_URL:latest
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_MEDIUM
