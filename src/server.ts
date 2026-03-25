@@ -3,7 +3,7 @@ import cors from 'cors';
 import { env, allowedOrigins } from './config/env';
 import { errorHandler } from './middleware/errorHandler';
 import router from './routes';
-import { ensureCategories } from './services/budgetService';
+import { ensureCategories, normalizeIncomeData } from './services/budgetService';
 
 const app = express();
 
@@ -45,6 +45,12 @@ app.listen(env.PORT, async () => {
   console.log(`   Environment: ${env.NODE_ENV}`);
   await ensureCategories();
   console.log(`   Categories: ready`);
+  const norm = await normalizeIncomeData();
+  if (norm.fixed || norm.duplicates || norm.emptyTemplates) {
+    console.log(`   Income normalize: fixed=${norm.fixed} dupes=${norm.duplicates} emptyTemplates=${norm.emptyTemplates}`);
+  } else {
+    console.log(`   Income data: clean`);
+  }
 });
 
 export default app;

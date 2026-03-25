@@ -357,6 +357,59 @@ export async function updateIncomeSource(
 export async function removeIncomeSource(id: string, budgetId: string) {
   const existing = await prisma.incomeSource.findFirst({ where: { id, budgetId } });
   if (!existing) throw new AppError(404, 'Income source not found');
+
+  if (existing.templateItemId) {
+    // ── Recurring source: cascade-delete future months too ─────────────────
+    const currentBudget = await prisma.monthlyBudget.findUniqueOrThrow({
+      where: { id: budgetId },
+    });
+
+    // Grab the templateId before deleting the item (needed for empty-template cleanup)
+    const templateItem = await prisma.incomeTemplateItem.findUnique({
+      where:  { id: existing.templateItemId },
+      select: { templateId: true },
+    });
+
+    // 1. Delete future months' sources that share this template item
+    await prisma.incomeSource.deleteMany({
+      where: {
+        templateItemId: existing.templateItemId,
+        id:             { not: id },
+        budget: {
+          OR: [
+            { year: { gt: currentBudget.year } },
+            { year: currentBudget.year, month: { gt: currentBudget.month } },
+          ],
+        },
+      },
+    });
+
+    // 2. Delete the template item (onDelete:SetNull nullifies templateItemId on
+    //    any remaining past-month sources; the current source is deleted in step 4)
+    await prisma.incomeTemplateItem.delete({ where: { id: existing.templateItemId } });
+
+    // 3. Fix past-month sources left with isFromTemplate=true + templateItemId=null
+    await prisma.incomeSource.updateMany({
+      where: { isFromTemplate: true, templateItemId: null },
+      data:  { isFromTemplate: false },
+    });
+
+    // 4. If the template is now empty, unlink it from any budgets and remove it
+    if (templateItem) {
+      const remaining = await prisma.incomeTemplateItem.count({
+        where: { templateId: templateItem.templateId },
+      });
+      if (remaining === 0) {
+        await prisma.monthlyBudget.updateMany({
+          where: { templateId: templateItem.templateId },
+          data:  { templateId: null },
+        });
+        await prisma.incomeTemplate.delete({ where: { id: templateItem.templateId } });
+      }
+    }
+  }
+
+  // Delete the source itself (for non-recurring sources this is the only step)
   await prisma.incomeSource.delete({ where: { id } });
 }
 
@@ -375,12 +428,45 @@ export async function toggleRecurring(sourceId: string, budgetId: string) {
 
   if (src.isFromTemplate && src.templateItemId) {
     // ── Toggle OFF: remove from template ────────────────────────────────────
+    const currentBudget = await prisma.monthlyBudget.findUniqueOrThrow({
+      where: { id: budgetId },
+    });
+
+    // 1. Hard-delete income sources in FUTURE months that were created from this
+    //    template item (the user is cutting off the recurring income going forward).
+    //    Past months retain their source as a historical record (normalized below).
+    await prisma.incomeSource.deleteMany({
+      where: {
+        templateItemId: src.templateItemId,
+        id:             { not: sourceId }, // keep the current month's source
+        budget: {
+          OR: [
+            { year: { gt: currentBudget.year } },
+            { year: currentBudget.year, month: { gt: currentBudget.month } },
+          ],
+        },
+      },
+    });
+
+    // 2. Delete the template item.
+    //    onDelete:SetNull will nullify templateItemId on any remaining sources
+    //    in past months; normalizeIncomeData() will then fix their isFromTemplate flag.
     await prisma.incomeTemplateItem.delete({ where: { id: src.templateItemId } });
+
+    // 3. Update the current month's source to one-time.
     const updated = await prisma.incomeSource.update({
       where:   { id: sourceId },
       data:    { isFromTemplate: false, templateItemId: null },
       include: { templateItem: true },
     });
+
+    // 4. Normalize past months' sources that now have templateItemId=null but
+    //    isFromTemplate=true (side-effect of onDelete:SetNull cascade).
+    await prisma.incomeSource.updateMany({
+      where: { isFromTemplate: true, templateItemId: null },
+      data:  { isFromTemplate: false },
+    });
+
     return toIncomeSourceDetail(updated);
   }
 
@@ -558,6 +644,79 @@ function getRecurringTargets(month: number, year: number, frequency: RecurringFr
     targets.push({ month, year: year + 1 });
   }
   return targets;
+}
+
+// ─── Data normalization ───────────────────────────────────────────────────────
+
+/**
+ * Cleans up inconsistencies in income_sources and income_templates.
+ * Called on server startup after ensureCategories().
+ *
+ * Fixes:
+ * 1. isFromTemplate=true + templateItemId=null → isFromTemplate=false
+ *    (left-overs from onDelete:SetNull cascade when template items were deleted)
+ *
+ * 2. Duplicate income sources for the same (budgetId, templateItemId) pair.
+ *    Keeps the oldest source (lowest id), deletes the rest.
+ *
+ * 3. Income templates with no items → unlinks any budgets pointing to them
+ *    and deletes the empty templates.
+ */
+export async function normalizeIncomeData(): Promise<{ fixed: number; duplicates: number; emptyTemplates: number }> {
+  // 1. Fix orphaned isFromTemplate flags
+  const { count: fixed } = await prisma.incomeSource.updateMany({
+    where: { isFromTemplate: true, templateItemId: null },
+    data:  { isFromTemplate: false },
+  });
+
+  // 2. Remove duplicate income sources (same budget + same templateItemId)
+  const sourcesWithTemplate = await prisma.incomeSource.findMany({
+    where:   { templateItemId: { not: null } },
+    orderBy: { id: 'asc' }, // deterministic: keep the earliest (lowest cuid)
+    select:  { id: true, budgetId: true, templateItemId: true },
+  });
+
+  const seen     = new Map<string, boolean>();
+  const toDelete: string[] = [];
+  for (const src of sourcesWithTemplate) {
+    const key = `${src.budgetId}::${src.templateItemId}`;
+    if (seen.has(key)) {
+      toDelete.push(src.id);
+    } else {
+      seen.set(key, true);
+    }
+  }
+
+  let duplicates = 0;
+  if (toDelete.length > 0) {
+    const { count } = await prisma.incomeSource.deleteMany({
+      where: { id: { in: toDelete } },
+    });
+    duplicates = count;
+  }
+
+  // 3. Remove income templates that have no items
+  const emptyTemplateIds = (
+    await prisma.incomeTemplate.findMany({
+      where:  { items: { none: {} } },
+      select: { id: true },
+    })
+  ).map((t) => t.id);
+
+  let emptyTemplates = 0;
+  if (emptyTemplateIds.length > 0) {
+    // Unlink budgets that still reference these templates
+    await prisma.monthlyBudget.updateMany({
+      where: { templateId: { in: emptyTemplateIds } },
+      data:  { templateId: null },
+    });
+    const { count } = await prisma.incomeTemplate.deleteMany({
+      where: { id: { in: emptyTemplateIds } },
+    });
+    emptyTemplates = count;
+  }
+
+  return { fixed, duplicates, emptyTemplates };
 }
 
 // ─── Income template operations ───────────────────────────────────────────────
