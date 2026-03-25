@@ -1,7 +1,7 @@
 substitutions:
   _REGION: europe-west1
   _SERVICE: budget-back
-  _REPO: budget-app                  # Artifact Registry repository name
+  _REPO: budget-app-back                # Artifact Registry repository name
 
   # ── Runtime env vars ──────────────────────────────────────────────────────
   # Sensitive values (DATABASE_URL) should be stored in Secret Manager and
